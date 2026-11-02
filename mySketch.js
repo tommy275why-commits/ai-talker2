@@ -770,7 +770,8 @@ function trainOnSourceText(text) {
           words[targetPosition - 1] ?? null
         ],
         target: words[targetPosition],
-        confidence: 1
+        confidence: 1,
+        trained: false
       };
       if (!rememberReplayExample(example)) continue;
 
@@ -810,7 +811,8 @@ function restoreReplayBuffer(savedExamples) {
     const example = {
       context: [0, 1, 2].map(index => typeof saved.context[index] === "string" ? saved.context[index] : null),
       target: saved.target,
-      confidence: Number.isFinite(saved.confidence) ? constrain(saved.confidence, 0, 1) : 1
+      confidence: Number.isFinite(saved.confidence) ? constrain(saved.confidence, 0, 1) : 1,
+      trained: saved.trained === true
     };
     rememberReplayExample(example);
   }
@@ -835,6 +837,7 @@ function trainReplayExample(example) {
   while (genesis.inputNodes.length < inputs.length) genesis.addInputNode();
   const probabilities = softmax(genesis.feedForward(inputs).slice(0, VOCABULARY.length));
   example.confidence = probabilities[target] || 0;
+  example.trained = true;
   genesis.learn({ action: target, probabilities }, 1.0);
   trainingExampleCount++;
   brainPanelNeedsUpdate = true;
@@ -844,7 +847,7 @@ function trainReplayExample(example) {
 function sampleReplayExample(excludedExample) {
   const excludedKey = replayExampleKey(excludedExample);
   const candidates = replayBuffer
-    .filter(example => replayExampleKey(example) !== excludedKey)
+    .filter(example => example.trained && replayExampleKey(example) !== excludedKey)
     .sort((a, b) => a.confidence - b.confidence)
     .slice(0, 20);
   if (candidates.length === 0) return null;
