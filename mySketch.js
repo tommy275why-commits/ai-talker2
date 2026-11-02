@@ -12,6 +12,7 @@ Upgrades in V6:
 */
 
 let genesis;
+let languageEvaluator;
 let copyBox;
 let userPromptBox;
 
@@ -19,6 +20,7 @@ let running = true;
 let totalSteps = 0;
 let episodeSteps = 0;
 let episodeScore = 0;
+let trainingExampleCount = 0;
 
 let lastDecision = null;
 let lastActionName = "Waiting";
@@ -146,6 +148,7 @@ function setup() {
 
   OUTPUT_COUNT = VOCABULARY.length + 4;
   genesis = new DynamicBrain(INPUT_COUNT, OUTPUT_COUNT, 7);
+  languageEvaluator = new WebLanguageEvaluator();
 
   loadLocalBrain();
   loadWorldMemory();
@@ -288,6 +291,7 @@ function drawStatsPanel() {
     ["Connections", genesis.connections.filter(c => c.enabled).length],
     ["Vocabulary Size", VOCABULARY.length],
     ["Words Spoken", totalSteps],
+    ["Training Examples", trainingExampleCount],
     ["World Records", worldMemory.length],
     ["Sources Online", onlineSources + "/" + WORLD_PROVIDER_ORDER.length],
     ["Last Word", lastActionName],
@@ -469,8 +473,11 @@ function calculateLanguageReward(wordIndex, punctuationVal) {
 
   let noveltyScore = newWord ? 0.5 : 0.05;
   let penalty = genesis.actionCounts[wordIndex] > 15 ? -0.15 : 0;
+  let evaluatorScore = languageEvaluator
+    ? languageEvaluator.evaluateStep(VOCABULARY[wordIndex], lastActionName)
+    : 0;
 
-  return constrain(noveltyScore + penalty, -0.5, 1.0);
+  return constrain(noveltyScore + penalty + evaluatorScore, -1.0, 1.0);
 }
 
 function collectInputs() {
@@ -542,7 +549,6 @@ function loadWorldMemory() {
     const saved = localStorage.getItem(WORLD_MEMORY_KEY);
     if (saved) worldMemory = JSON.parse(saved);
     if (!Array.isArray(worldMemory)) worldMemory = [];
-    refreshBrainSensors();
   } catch (err) {
     worldMemory = [];
   }
@@ -563,15 +569,6 @@ function recordWorldObservation(id, value, sourceUrl) {
   };
   worldMemory.unshift(observation);
   worldMemory = worldMemory.slice(0, MAX_WORLD_MEMORY);
-}
-
-function refreshBrainSensors() {
-  webSensors[0].val = random(-1, 1);
-  webSensors[1].val = random(-1, 1);
-  webSensors[2].val = random(-1, 1);
-  webSensors[3].val = random(-1, 1);
-  webSensors[4].val = random(-1, 1);
-  webSensors[5].val = random(-1, 1);
 }
 
 async function fetchWorldJSON(url) {
@@ -621,15 +618,18 @@ async function scanNextProvider() {
 async function fetchWikipedia() {
   const url = "https://en.wikipedia.org/api/rest_v1/page/random/summary";
   const data = await fetchWorldJSON(url);
-  if (data.extract) extractTextToVocabulary(data.extract);
+  if (data.extract) ingestSourceText("Wikipedia", data.extract, data.content_urls?.desktop?.page || url);
 }
 
 async function fetchHackerNews() {
   const url = "https://hacker-news.firebaseio.com/v0/topstories.json";
   const ids = await fetchWorldJSON(url);
   if (ids && ids.length) {
-    const item = await fetchWorldJSON(`https://hacker-news.firebaseio.com/v0/item/${ids[0]}.json`);
-    if (item && item.title) extractTextToVocabulary(item.title);
+    const items = await Promise.all(ids.slice(0, 5).map(id =>
+      fetchWorldJSON(`https://hacker-news.firebaseio.com/v0/item/${id}.json`)
+    ));
+    const titles = items.filter(item => item && item.title).map(item => item.title);
+    if (titles.length) ingestSourceText("Hacker News", titles.join(". "), "https://news.ycombinator.com/");
   }
 }
 
@@ -637,28 +637,244 @@ async function fetchNASAImage() {
   const url = "https://science.nasa.gov/wp-json/wp/v2/apod-basic/?per_page=1";
   const result = await fetchWorldJSON(url);
   const data = Array.isArray(result) ? result[0] : result;
-  if (data && data.title) extractTextToVocabulary(typeof data.title === 'string' ? data.title : data.title.rendered);
-}
-
-function extractTextToVocabulary(text) {
-  let cleanWords = text.toLowerCase().split(/\s+/);
-  for (let w of cleanWords) {
-    w = w.replace(/[^a-z]/g, '');
-    if (w.length >= 4 && w.length <= 10) {
-      addWordToVocabulary(w);
-    }
+  if (data && data.title) {
+    const title = typeof data.title === "string" ? data.title : data.title.rendered;
+    ingestSourceText("NASA", title, data.link || url);
   }
 }
 
-async function fetchWeather() { refreshBrainSensors(); }
-async function fetchAirQuality() { refreshBrainSensors(); }
-async function fetchEarthquakes() { refreshBrainSensors(); }
-async function fetchSpaceWeather() { refreshBrainSensors(); }
-async function fetchWorldBank() { refreshBrainSensors(); }
-async function fetchCountries() { refreshBrainSensors(); }
-async function fetchGitHub() { refreshBrainSensors(); }
-async function fetchOpenLibrary() { refreshBrainSensors(); }
-async function fetchMetMuseum() { refreshBrainSensors(); }
+function extractTextToVocabulary(text) {
+  let cleanWords = text.toLowerCase().match(/[a-z]+/g) || [];
+  let previousSize = VOCABULARY.length;
+  for (let w of cleanWords) {
+    if (w.length <= 20) {
+      addWordToVocabulary(w);
+    }
+  }
+  return VOCABULARY.length - previousSize;
+}
+
+function ingestSourceText(source, text, sourceUrl) {
+  const content = String(text || "").trim();
+  if (!content) return 0;
+  if (languageEvaluator) languageEvaluator.updateWebContext(content);
+  const addedWords = extractTextToVocabulary(content);
+  const trainedExamples = trainOnSourceText(content);
+  recordWorldObservation(source, content.slice(0, 600), sourceUrl);
+  webSensors[5].val = constrain(webSensors[5].val + Math.min(content.length / 3000, 0.2), -1, 1);
+  if (trainedExamples > 0) saveLocalBrain();
+  return addedWords;
+}
+
+function trainOnSourceText(text) {
+  if (!genesis) return 0;
+
+  let examples = 0;
+
+  const sentences = String(text).toLowerCase().split(/[.!?]+/);
+  for (const sentence of sentences) {
+    if (examples >= 80) break;
+    const words = (sentence.match(/[a-z]+/g) || []).filter(word => word.length <= 20);
+    const wordIndices = words.map(word => VOCABULARY.indexOf(word));
+    const stride = Math.max(1, Math.ceil(words.length / (80 - examples)));
+
+    for (let targetPosition = 0; targetPosition < wordIndices.length && examples < 80; targetPosition += stride) {
+      const contextIndices = [
+        wordIndices[targetPosition - 3] ?? 0,
+        wordIndices[targetPosition - 2] ?? 0,
+        wordIndices[targetPosition - 1] ?? 0
+      ];
+      const contextValues = contextIndices.map(index => (index / VOCABULARY.length) * 2 - 1);
+      const inputs = [
+        0, 0, 0,
+        ...contextValues,
+        0, 0, 0, 0, 1,
+        ...webSensors.map(sensor => sensor.val)
+      ];
+
+      while (genesis.inputNodes.length < inputs.length) genesis.addInputNode();
+
+      const target = wordIndices[targetPosition];
+      const probabilities = softmax(genesis.feedForward(inputs).slice(0, VOCABULARY.length));
+      genesis.learn({ action: target, probabilities }, 1.0);
+      examples++;
+    }
+  }
+
+  trainingExampleCount += examples;
+  return examples;
+}
+
+class WebLanguageEvaluator {
+  constructor() {
+    this.activeWebKeywords = new Set();
+    this.recentWords = [];
+    this.maxRecentWords = 8;
+    this.wordCategories = {
+      nouns: new Set([
+        "world", "data", "system", "pulse", "orbit", "earth", "memory", "light", "time", "network"
+      ]),
+      verbs: new Set([
+        "expands", "runs", "signals", "grows", "connects", "rotates", "reads", "stores"
+      ]),
+      adjectives: new Set([
+        "solar", "active", "global", "bright", "dense", "recurrent", "deep"
+      ])
+    };
+  }
+
+  updateWebContext(rawText) {
+    const words = rawText.toLowerCase().replace(/[^a-z\s]/g, " ").split(/\s+/);
+    this.activeWebKeywords = new Set(words.filter(word => word.length > 4));
+  }
+
+  evaluateStep(word, lastWord) {
+    let reward = 0;
+    const cleanWord = word.toLowerCase().trim();
+    const cleanLast = lastWord ? lastWord.toLowerCase().trim() : "";
+
+    if (this.activeWebKeywords.has(cleanWord)) reward += 0.7;
+
+    const lastType = this.getPOS(cleanLast);
+    const currentType = this.getPOS(cleanWord);
+    if (lastType === "adjective" && currentType === "noun") reward += 0.5;
+    if (lastType === "noun" && currentType === "verb") reward += 0.5;
+    if (lastType === "verb" && currentType === "verb") reward -= 0.6;
+
+    const repeatCount = this.recentWords.filter(recentWord => recentWord === cleanWord).length;
+    if (repeatCount > 3) reward -= 0.8;
+
+    this.recentWords.push(cleanWord);
+    if (this.recentWords.length > this.maxRecentWords) this.recentWords.shift();
+
+    return constrain(reward, -1.0, 1.0);
+  }
+
+  getPOS(word) {
+    if (this.wordCategories.nouns.has(word)) return "noun";
+    if (this.wordCategories.verbs.has(word)) return "verb";
+    if (this.wordCategories.adjectives.has(word)) return "adjective";
+    return "unknown";
+  }
+}
+
+function setSensorFromRange(index, value, min, max) {
+  if (Number.isFinite(value)) {
+    webSensors[index].val = constrain(((value - min) / (max - min)) * 2 - 1, -1, 1);
+  }
+}
+
+async function fetchWeather() {
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${GENESIS_LOCATION.latitude}&longitude=${GENESIS_LOCATION.longitude}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code`;
+  const data = await fetchWorldJSON(url);
+  const current = data.current;
+  if (!current) throw new Error("No current weather data");
+
+  const temperature = current.temperature_2m;
+  const humidity = current.relative_humidity_2m;
+  const wind = current.wind_speed_10m;
+  const code = current.weather_code;
+  const conditions = code === 0 ? "clear sunshine" : code <= 3 ? "partly cloudy" : code <= 48 ? "foggy conditions" : code <= 67 ? "rain showers" : code <= 77 ? "snow showers" : code <= 82 ? "rain showers" : "thunderstorms";
+  setSensorFromRange(0, temperature, -30, 45);
+  setSensorFromRange(1, humidity, 0, 100);
+  setSensorFromRange(2, wind, 0, 100);
+  ingestSourceText("Weather", `${conditions} temperature ${temperature} humidity ${humidity} wind ${wind}`, url);
+}
+
+async function fetchAirQuality() {
+  const url = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${GENESIS_LOCATION.latitude}&longitude=${GENESIS_LOCATION.longitude}&current=us_aqi,pm2_5,pm10`;
+  const data = await fetchWorldJSON(url);
+  const current = data.current;
+  if (!current) throw new Error("No current air-quality data");
+
+  const aqi = current.us_aqi;
+  const quality = aqi <= 50 ? "good air quality" : aqi <= 100 ? "moderate air quality" : aqi <= 150 ? "unhealthy air quality" : "poor air quality";
+  setSensorFromRange(3, aqi, 0, 200);
+  ingestSourceText("Air quality", `${quality} AQI ${aqi} particulate ${current.pm2_5} ${current.pm10}`, url);
+}
+
+async function fetchEarthquakes() {
+  const url = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson";
+  const data = await fetchWorldJSON(url);
+  const events = (data.features || []).slice(0, 8);
+  setSensorFromRange(4, events.length, 0, 20);
+  const descriptions = events.map(event => event.properties?.title).filter(Boolean);
+  if (descriptions.length) {
+    ingestSourceText("Earthquakes", descriptions.join(". "), url);
+  } else {
+    recordWorldObservation("Earthquakes", "No magnitude 2.5 or greater events in the past day", url);
+  }
+}
+
+async function fetchSpaceWeather() {
+  const end = new Date();
+  const start = new Date(end.getTime() - 2 * 24 * 60 * 60 * 1000);
+  const formatDate = date => date.toISOString().slice(0, 10);
+  const url = `https://api.nasa.gov/DONKI/CME?startDate=${formatDate(start)}&endDate=${formatDate(end)}&api_key=DEMO_KEY`;
+  const events = await fetchWorldJSON(url);
+  const descriptions = (Array.isArray(events) ? events : []).slice(0, 8).map(event =>
+    event.cmeAnalyses?.[0]?.note || event.catalog || "solar coronal mass ejection"
+  );
+  if (descriptions.length) ingestSourceText("NASA space weather", descriptions.join(". "), url);
+  else recordWorldObservation("NASA space weather", "No recent coronal mass ejection reports", url);
+}
+
+async function fetchWorldBank() {
+  const url = "https://api.worldbank.org/v2/country?format=json&per_page=300";
+  const data = await fetchWorldJSON(url);
+  const countries = Array.isArray(data?.[1]) ? data[1] : [];
+  const names = countries.slice(0, 80).map(country =>
+    `${country.name || ""} ${country.region?.value || ""} ${country.incomeLevel?.value || ""}`
+  );
+  if (names.length) ingestSourceText("World Bank", names.join(". "), url);
+}
+
+async function fetchCountries() {
+  const url = "https://restcountries.com/v3.1/all?fields=name,capital,region,subregion,languages";
+  const data = await fetchWorldJSON(url);
+  const descriptions = (Array.isArray(data) ? data : []).slice(0, 80).map(country => {
+    const languages = Object.values(country.languages || {}).join(" ");
+    return `${country.name?.common || ""} ${country.capital?.join(" ") || ""} ${country.region || ""} ${country.subregion || ""} ${languages}`;
+  });
+  if (descriptions.length) ingestSourceText("Countries", descriptions.join(". "), url);
+}
+
+async function fetchGitHub() {
+  const topics = ["creative-coding", "language-model", "generative-art", "p5js", "artificial-intelligence"];
+  const topic = random(topics);
+  const url = `https://api.github.com/search/repositories?q=${encodeURIComponent(topic)}&sort=updated&per_page=10`;
+  const data = await fetchWorldJSON(url);
+  const descriptions = (data.items || []).map(repo =>
+    `${repo.name || ""} ${repo.description || ""} ${(repo.topics || []).join(" ")}`
+  );
+  if (descriptions.length) ingestSourceText("GitHub", descriptions.join(". "), url);
+}
+
+async function fetchOpenLibrary() {
+  const subjects = ["science", "nature", "poetry", "mythology", "astronomy", "folklore"];
+  const subject = random(subjects);
+  const url = `https://openlibrary.org/subjects/${subject}.json?limit=20`;
+  const data = await fetchWorldJSON(url);
+  const descriptions = (data.works || []).map(work =>
+    `${work.title || ""} ${(work.authors || []).map(author => author.name).join(" ")}`
+  );
+  if (descriptions.length) ingestSourceText("Open Library", descriptions.join(". "), url);
+}
+
+async function fetchMetMuseum() {
+  const queries = ["moon", "bird", "flower", "water", "landscape", "star"];
+  const query = random(queries);
+  const searchUrl = `https://collectionapi.metmuseum.org/public/collection/v1/search?hasImages=true&q=${encodeURIComponent(query)}`;
+  const search = await fetchWorldJSON(searchUrl);
+  const ids = (search.objectIDs || []).slice(0, 4);
+  const objects = await Promise.all(ids.map(id =>
+    fetchWorldJSON(`https://collectionapi.metmuseum.org/public/collection/v1/objects/${id}`)
+  ));
+  const descriptions = objects.map(object =>
+    `${object.title || ""} ${object.culture || ""} ${object.period || ""} ${object.medium || ""}`
+  ).filter(text => text.trim());
+  if (descriptions.length) ingestSourceText("Met Museum", descriptions.join(". "), searchUrl);
+}
 
 const WORLD_FETCHERS = {
   weather: fetchWeather, air: fetchAirQuality, earthquake: fetchEarthquakes,
@@ -972,6 +1188,7 @@ function buildSaveData() {
     savedAt: new Date().toISOString(),
     brain: genesis.serialize(),
     totalSteps: totalSteps,
+    trainingExampleCount: trainingExampleCount,
     bestFitness: bestFitness,
     bestBrainData: bestBrainData
   };
@@ -994,6 +1211,7 @@ function loadLocalBrain() {
     if (data.brain && data.brain.nodes && data.brain.connections) {
       genesis = DynamicBrain.fromData(data.brain);
       totalSteps = data.totalSteps || 0;
+      trainingExampleCount = data.trainingExampleCount || 0;
       bestFitness = data.bestFitness ?? -Infinity;
       bestBrainData = data.bestBrainData || null;
       setStatus("Previous V6 language brain restored");
@@ -1024,6 +1242,7 @@ function handleBrainFile(file) {
 
     genesis = DynamicBrain.fromData(savedBrain);
     totalSteps = data.totalSteps || 0;
+    trainingExampleCount = data.trainingExampleCount || 0;
     bestFitness = data.bestFitness ?? -Infinity;
     bestBrainData = data.bestBrainData || null;
 
