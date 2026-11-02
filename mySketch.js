@@ -21,6 +21,13 @@ let totalSteps = 0;
 let episodeSteps = 0;
 let episodeScore = 0;
 let trainingExampleCount = 0;
+let trainingQueue = [];
+let trainingScheduled = false;
+let trainingGeneration = 0;
+let worldScanGeneration = 0;
+let brainPanelBuffer;
+let brainPanelNeedsUpdate = true;
+let brainPanelLastDraw = -30;
 
 let lastDecision = null;
 let lastActionName = "Waiting";
@@ -50,10 +57,11 @@ const WORLD = {
 };
 
 // Dynamic Vocabulary List (Starts base, expands from web scans)
-let VOCABULARY = [
+const BASE_VOCABULARY = [
   "system", "world", "signal", "pulse", "memory",
   "network", "orbit", "earth", "time", "data", "growth", "light"
 ];
+let VOCABULARY = [...BASE_VOCABULARY];
 
 // Recurrent Context Window (Stores indices of last 3 tokens)
 let tokenHistory = [0, 0, 0];
@@ -108,6 +116,9 @@ const WORLD_PROVIDER_ORDER = [
 function setup() {
   createCanvas(1000, 700);
   pixelDensity(1);
+  frameRate(30);
+  brainPanelBuffer = createGraphics(236, 242);
+  brainPanelBuffer.pixelDensity(1);
 
   // 1. Terminal Output Box
   copyBox = createElement('textarea');
@@ -155,6 +166,7 @@ function setup() {
 
   let fileInput = createFileInput(handleBrainFile);
   fileInput.position(20, 665);
+  fileInput.attribute('aria-label', 'Import a saved Genesis brain JSON file');
 
   setStatus("Genesis V6 (Dynamic Vocabulary Engine) Ready");
   scanNextProvider();
@@ -182,6 +194,7 @@ function addWordToVocabulary(word) {
 
     // Dynamically expand output nodes in neural network
     if (genesis) genesis.addOutputNode();
+    brainPanelNeedsUpdate = true;
   }
 }
 
@@ -194,7 +207,7 @@ function draw() {
   drawStatsPanel();
   drawControls();
 
-  if (running && frameCount % 8 === 0) {
+  if (running && frameCount % 12 === 0) {
     performStep();
   }
 
@@ -259,7 +272,13 @@ function drawBrainPanel() {
   text("NEURAL STRUCTURE", x + 14, y + 19);
 
   textStyle(NORMAL);
-  genesis.drawNetwork(x + 12, y + 42, w - 24, h - 58);
+  if (brainPanelNeedsUpdate && frameCount - brainPanelLastDraw >= 30) {
+    brainPanelBuffer.clear();
+    genesis.drawNetwork(0, 0, w - 24, h - 58, brainPanelBuffer);
+    brainPanelNeedsUpdate = false;
+    brainPanelLastDraw = frameCount;
+  }
+  image(brainPanelBuffer, x + 12, y + 42);
 
   fill(135, 150, 170);
   textSize(10);
@@ -316,8 +335,8 @@ function drawStatsPanel() {
 function drawControls() {
   let x = 300;
   let y = 635;
-  let w = 76;
-  let gap = 6;
+  let w = 68;
+  let gap = 5;
 
   let labels = [
     running ? "PAUSE" : "RUN",
@@ -327,12 +346,18 @@ function drawControls() {
     "SAVE",
     "EXPORT",
     "CLEAR",
+    "RESET",
     "SCAN"
   ];
 
   for (let i = 0; i < labels.length; i++) {
     drawButton(x + i * (w + gap), y, w, 34, labels[i]);
   }
+
+  fill(135, 150, 170);
+  textAlign(LEFT, CENTER);
+  textSize(10);
+  text("IMPORT BRAIN JSON", 20, 650);
 
   if (statusTimer > 0) {
     fill(120, 205, 160);
@@ -359,13 +384,13 @@ function drawButton(x, y, w, h, label) {
 function mousePressed() {
   let x = 300;
   let y = 635;
-  let w = 76;
-  let gap = 6;
+  let w = 68;
+  let gap = 5;
 
   if (mouseY < y || mouseY > y + 34) return;
 
   let buttonIndex = floor((mouseX - x) / (w + gap));
-  if (buttonIndex < 0 || buttonIndex > 7) return;
+  if (buttonIndex < 0 || buttonIndex > 8) return;
 
   let localX = mouseX - (x + buttonIndex * (w + gap));
   if (localX > w) return;
@@ -383,7 +408,56 @@ function mousePressed() {
     copyBox.value("// TERMINAL CLEARED\n\n");
     generatedTextLog = "";
     setStatus("Text log cleared");
-  } else if (buttonIndex === 7) scanNextProvider();
+  } else if (buttonIndex === 7) resetBot();
+  else if (buttonIndex === 8) scanNextProvider();
+}
+
+function resetBot() {
+  if (!confirm("Reset Genesis and erase its saved brain and world memory?")) return;
+
+  trainingGeneration++;
+  trainingQueue = [];
+  worldScanGeneration++;
+  worldScanBusy = false;
+
+  VOCABULARY = [...BASE_VOCABULARY];
+  OUTPUT_COUNT = VOCABULARY.length + 4;
+  genesis = new DynamicBrain(INPUT_COUNT, OUTPUT_COUNT, 7);
+  languageEvaluator = new WebLanguageEvaluator();
+
+  running = true;
+  totalSteps = 0;
+  episodeSteps = 0;
+  episodeScore = 0;
+  trainingExampleCount = 0;
+  lastDecision = null;
+  lastActionName = "Waiting";
+  lastReward = 0;
+  bestFitness = -Infinity;
+  bestBrainData = null;
+  tokenHistory = [0, 0, 0];
+  userPromptSignal = 0;
+  generatedTextLog = "";
+  worldMemory = [];
+  worldSourceStatus = {};
+  worldScanIndex = 0;
+  worldProviderLastFetch = {};
+  for (const sensor of webSensors) sensor.val = 0;
+
+  copyBox.value("// GENESIS RESET\n\n");
+  userPromptBox.value("");
+  brainPanelNeedsUpdate = true;
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(WORLD_MEMORY_KEY);
+  } catch (err) {
+    setStatus("Reset in memory; browser storage unavailable");
+    return;
+  }
+
+  saveLocalBrain();
+  saveWorldMemory();
+  setStatus("Genesis reset to a fresh brain");
 }
 
 // =============================================================================
@@ -448,6 +522,7 @@ function performStep() {
   };
 
   genesis.learn(decision, reward);
+  brainPanelNeedsUpdate = true;
 
   lastDecision = decision;
   lastActionName = word;
@@ -597,20 +672,25 @@ async function scanNextProvider() {
   }
 
   worldScanBusy = true;
+  const scanGeneration = worldScanGeneration;
   worldProviderLastFetch[provider] = now;
   setProviderStatus(provider, "Retrieving...");
   setStatus("Genesis absorbing text from: " + provider);
 
   try {
     await WORLD_FETCHERS[provider]();
+    if (scanGeneration !== worldScanGeneration) return;
     setProviderStatus(provider, "Online");
     setStatus("Extracted new vocabulary from " + provider);
   } catch (err) {
+    if (scanGeneration !== worldScanGeneration) return;
     setProviderStatus(provider, "Failed: " + err.message);
+  } finally {
+    if (scanGeneration === worldScanGeneration) {
+      worldScanBusy = false;
+      saveWorldMemory();
+    }
   }
-
-  worldScanBusy = false;
-  saveWorldMemory();
 }
 
 // --- DYNAMIC WEB TEXT PARSERS ---
@@ -662,7 +742,7 @@ function ingestSourceText(source, text, sourceUrl) {
   const trainedExamples = trainOnSourceText(content);
   recordWorldObservation(source, content.slice(0, 600), sourceUrl);
   webSensors[5].val = constrain(webSensors[5].val + Math.min(content.length / 3000, 0.2), -1, 1);
-  if (trainedExamples > 0) saveLocalBrain();
+  if (trainedExamples === 0) saveLocalBrain();
   return addedWords;
 }
 
@@ -692,17 +772,46 @@ function trainOnSourceText(text) {
         ...webSensors.map(sensor => sensor.val)
       ];
 
-      while (genesis.inputNodes.length < inputs.length) genesis.addInputNode();
-
-      const target = wordIndices[targetPosition];
-      const probabilities = softmax(genesis.feedForward(inputs).slice(0, VOCABULARY.length));
-      genesis.learn({ action: target, probabilities }, 1.0);
+      trainingQueue.push({ inputs, target: wordIndices[targetPosition] });
       examples++;
     }
   }
 
-  trainingExampleCount += examples;
+  if (examples > 0) scheduleTrainingBatch();
   return examples;
+}
+
+function scheduleTrainingBatch() {
+  if (trainingScheduled || trainingQueue.length === 0) return;
+
+  trainingScheduled = true;
+  const scheduledGeneration = trainingGeneration;
+  const trainBatch = () => {
+    if (scheduledGeneration !== trainingGeneration) {
+      trainingScheduled = false;
+      scheduleTrainingBatch();
+      return;
+    }
+
+    trainingScheduled = false;
+    for (let i = 0; i < 2 && trainingQueue.length > 0; i++) {
+      const example = trainingQueue.shift();
+      while (genesis.inputNodes.length < example.inputs.length) genesis.addInputNode();
+      const probabilities = softmax(genesis.feedForward(example.inputs).slice(0, VOCABULARY.length));
+      genesis.learn({ action: example.target, probabilities }, 1.0);
+      trainingExampleCount++;
+      brainPanelNeedsUpdate = true;
+    }
+
+    if (trainingQueue.length > 0) scheduleTrainingBatch();
+    else saveLocalBrain();
+  };
+
+  if (typeof requestIdleCallback === "function") {
+    requestIdleCallback(trainBatch, { timeout: 500 });
+  } else {
+    setTimeout(trainBatch, 50);
+  }
 }
 
 class WebLanguageEvaluator {
@@ -1083,7 +1192,7 @@ class DynamicBrain {
     }
   }
 
-  drawNetwork(x, y, w, h) {
+  drawNetwork(x, y, w, h, graphics) {
     let layers = [...new Set(this.nodes.map(n => n.layer))].sort((a, b) => a - b);
     let positions = new Map();
 
@@ -1104,25 +1213,25 @@ class DynamicBrain {
       if (!a || !b) continue;
 
       if (!c.enabled) {
-        stroke(75, 55);
-        strokeWeight(0.7);
+        graphics.stroke(75, 55);
+        graphics.strokeWeight(0.7);
       } else {
-        stroke(c.weight >= 0 ? color(50, 180, 220, 180) : color(230, 95, 95, 180));
-        strokeWeight(constrain(abs(c.weight) * 1.1, 0.5, 3));
+        graphics.stroke(c.weight >= 0 ? graphics.color(50, 180, 220, 180) : graphics.color(230, 95, 95, 180));
+        graphics.strokeWeight(constrain(abs(c.weight) * 1.1, 0.5, 3));
       }
-      line(a.x, a.y, b.x, b.y);
+      graphics.line(a.x, a.y, b.x, b.y);
     }
 
     for (let n of this.nodes) {
       let p = positions.get(n.id);
       if (!p) continue;
 
-      noStroke();
-      if (n.type === "input") fill(65, 210, 130);
-      else if (n.type === "output") fill(245, 165, 70);
-      else fill(190, 200, 220);
+      graphics.noStroke();
+      if (n.type === "input") graphics.fill(65, 210, 130);
+      else if (n.type === "output") graphics.fill(245, 165, 70);
+      else graphics.fill(190, 200, 220);
 
-      circle(p.x, p.y, n.type === "hidden" ? 7 : 9);
+      graphics.circle(p.x, p.y, n.type === "hidden" ? 7 : 9);
     }
   }
 
@@ -1245,6 +1354,10 @@ function handleBrainFile(file) {
     trainingExampleCount = data.trainingExampleCount || 0;
     bestFitness = data.bestFitness ?? -Infinity;
     bestBrainData = data.bestBrainData || null;
+    OUTPUT_COUNT = VOCABULARY.length + 4;
+    trainingGeneration++;
+    trainingQueue = [];
+    brainPanelNeedsUpdate = true;
 
     saveLocalBrain();
     setStatus("Language brain imported successfully");
