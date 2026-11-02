@@ -24,6 +24,8 @@ let trainingExampleCount = 0;
 let trainingQueue = [];
 let trainingScheduled = false;
 let trainingGeneration = 0;
+let replayBuffer = [];
+let replayExampleKeys = new Set();
 let worldScanGeneration = 0;
 let brainPanelBuffer;
 let brainPanelNeedsUpdate = true;
@@ -43,6 +45,7 @@ let generatedTextLog = "";
 const STORAGE_KEY = "GENESIS_BRAIN_V6";
 const WORLD_MEMORY_KEY = "GENESIS_WORLD_MEMORY_V6";
 const MAX_WORLD_MEMORY = 400;
+const MAX_REPLAY_EXAMPLES = 500;
 
 const GENESIS_LOCATION = {
   latitude: 41.70,
@@ -430,6 +433,8 @@ function resetBot() {
   episodeSteps = 0;
   episodeScore = 0;
   trainingExampleCount = 0;
+  replayBuffer = [];
+  replayExampleKeys = new Set();
   lastDecision = null;
   lastActionName = "Waiting";
   lastReward = 0;
@@ -755,30 +760,95 @@ function trainOnSourceText(text) {
   for (const sentence of sentences) {
     if (examples >= 80) break;
     const words = (sentence.match(/[a-z]+/g) || []).filter(word => word.length <= 20);
-    const wordIndices = words.map(word => VOCABULARY.indexOf(word));
     const stride = Math.max(1, Math.ceil(words.length / (80 - examples)));
 
-    for (let targetPosition = 0; targetPosition < wordIndices.length && examples < 80; targetPosition += stride) {
-      const contextIndices = [
-        wordIndices[targetPosition - 3] ?? 0,
-        wordIndices[targetPosition - 2] ?? 0,
-        wordIndices[targetPosition - 1] ?? 0
-      ];
-      const contextValues = contextIndices.map(index => (index / VOCABULARY.length) * 2 - 1);
-      const inputs = [
-        0, 0, 0,
-        ...contextValues,
-        0, 0, 0, 0, 1,
-        ...webSensors.map(sensor => sensor.val)
-      ];
+    for (let targetPosition = 0; targetPosition < words.length && examples < 80; targetPosition += stride) {
+      const example = {
+        context: [
+          words[targetPosition - 3] ?? null,
+          words[targetPosition - 2] ?? null,
+          words[targetPosition - 1] ?? null
+        ],
+        target: words[targetPosition],
+        confidence: 1
+      };
+      if (!rememberReplayExample(example)) continue;
 
-      trainingQueue.push({ inputs, target: wordIndices[targetPosition] });
+      trainingQueue.push(example);
       examples++;
     }
   }
 
   if (examples > 0) scheduleTrainingBatch();
   return examples;
+}
+
+function replayExampleKey(example) {
+  return JSON.stringify([example.context, example.target]);
+}
+
+function rememberReplayExample(example) {
+  const key = replayExampleKey(example);
+  if (replayExampleKeys.has(key)) return false;
+
+  replayExampleKeys.add(key);
+  replayBuffer.push(example);
+  if (replayBuffer.length > MAX_REPLAY_EXAMPLES) {
+    const removed = replayBuffer.shift();
+    replayExampleKeys.delete(replayExampleKey(removed));
+  }
+  return true;
+}
+
+function restoreReplayBuffer(savedExamples) {
+  replayBuffer = [];
+  replayExampleKeys = new Set();
+  if (!Array.isArray(savedExamples)) return;
+
+  for (const saved of savedExamples.slice(-MAX_REPLAY_EXAMPLES)) {
+    if (!saved || !Array.isArray(saved.context) || typeof saved.target !== "string") continue;
+    const example = {
+      context: [0, 1, 2].map(index => typeof saved.context[index] === "string" ? saved.context[index] : null),
+      target: saved.target,
+      confidence: Number.isFinite(saved.confidence) ? constrain(saved.confidence, 0, 1) : 1
+    };
+    rememberReplayExample(example);
+  }
+}
+
+function trainReplayExample(example) {
+  const target = VOCABULARY.indexOf(example.target);
+  if (target < 0) return false;
+
+  const contextIndices = example.context.map(word => {
+    const index = word ? VOCABULARY.indexOf(word) : 0;
+    return index >= 0 ? index : 0;
+  });
+  const contextValues = contextIndices.map(index => (index / VOCABULARY.length) * 2 - 1);
+  const inputs = [
+    0, 0, 0,
+    ...contextValues,
+    0, 0, 0, 0, 1,
+    ...webSensors.map(sensor => sensor.val)
+  ];
+
+  while (genesis.inputNodes.length < inputs.length) genesis.addInputNode();
+  const probabilities = softmax(genesis.feedForward(inputs).slice(0, VOCABULARY.length));
+  example.confidence = probabilities[target] || 0;
+  genesis.learn({ action: target, probabilities }, 1.0);
+  trainingExampleCount++;
+  brainPanelNeedsUpdate = true;
+  return true;
+}
+
+function sampleReplayExample(excludedExample) {
+  const excludedKey = replayExampleKey(excludedExample);
+  const candidates = replayBuffer
+    .filter(example => replayExampleKey(example) !== excludedKey)
+    .sort((a, b) => a.confidence - b.confidence)
+    .slice(0, 20);
+  if (candidates.length === 0) return null;
+  return candidates[Math.floor(Math.random() * candidates.length)];
 }
 
 function scheduleTrainingBatch() {
@@ -794,13 +864,11 @@ function scheduleTrainingBatch() {
     }
 
     trainingScheduled = false;
-    for (let i = 0; i < 2 && trainingQueue.length > 0; i++) {
-      const example = trainingQueue.shift();
-      while (genesis.inputNodes.length < example.inputs.length) genesis.addInputNode();
-      const probabilities = softmax(genesis.feedForward(example.inputs).slice(0, VOCABULARY.length));
-      genesis.learn({ action: example.target, probabilities }, 1.0);
-      trainingExampleCount++;
-      brainPanelNeedsUpdate = true;
+    if (trainingQueue.length > 0) {
+      const freshExample = trainingQueue.shift();
+      trainReplayExample(freshExample);
+      const replayExample = sampleReplayExample(freshExample);
+      if (replayExample) trainReplayExample(replayExample);
     }
 
     if (trainingQueue.length > 0) scheduleTrainingBatch();
@@ -1298,6 +1366,7 @@ function buildSaveData() {
     brain: genesis.serialize(),
     totalSteps: totalSteps,
     trainingExampleCount: trainingExampleCount,
+    replayBuffer: replayBuffer,
     bestFitness: bestFitness,
     bestBrainData: bestBrainData
   };
@@ -1321,6 +1390,7 @@ function loadLocalBrain() {
       genesis = DynamicBrain.fromData(data.brain);
       totalSteps = data.totalSteps || 0;
       trainingExampleCount = data.trainingExampleCount || 0;
+      restoreReplayBuffer(data.replayBuffer);
       bestFitness = data.bestFitness ?? -Infinity;
       bestBrainData = data.bestBrainData || null;
       setStatus("Previous V6 language brain restored");
@@ -1352,6 +1422,7 @@ function handleBrainFile(file) {
     genesis = DynamicBrain.fromData(savedBrain);
     totalSteps = data.totalSteps || 0;
     trainingExampleCount = data.trainingExampleCount || 0;
+    restoreReplayBuffer(data.replayBuffer);
     bestFitness = data.bestFitness ?? -Infinity;
     bestBrainData = data.bestBrainData || null;
     OUTPUT_COUNT = VOCABULARY.length + 4;
